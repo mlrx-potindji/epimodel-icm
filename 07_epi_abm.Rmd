@@ -3,186 +3,221 @@ title: "07_epi_abm"
 output: html_document
 ---
 
-# ODEs of the bi_strain model 
-
-The equations below are describing a compartmental model 
-
-\begin{align*}
-\frac{dS_p}{dt} &= (1 - \lambda_{cr} - \lambda_{cs} - \lambda_{ir} - \lambda_{is})\Lambda - (\beta_{np}^r + \beta_{np}^s)S_p - \tau_s S_p \\
-\frac{dC_p^s}{dt} &= \lambda_{cs}\Lambda + (1-x)\beta_{np}^s S_p - (\gamma_s + \tau_s + \mu_c)C_p^s \\  
-\frac{dI_p^s}{dt} &= \lambda_{is}\Lambda + x\beta_{np}^s S_p + \gamma_s C_p^s - (\Psi_s + \mu_i^s)I_p^s \\  
-\frac{dC_p^r}{dt} &= \lambda_{cr}\Lambda + (1-x)\beta_{np}^r S_p - (\gamma_r + \tau_r + \mu_c)C_p^r \\  
-\frac{dI_p^r}{dt} &= \lambda_{ir}\Lambda + x\beta_{np}^r S_p + \gamma_r C_p^r - (\Psi_r + \mu_i^r)I_p^r \\  
-\frac{dU_n}{dt} &= -(\beta_{pn}^r + \beta_{pn}^s) U_n + \delta (C_n^r + C_n^s) \\  
-\frac{dC_n^s}{dt} &= \beta_{pn}^s U_n - \delta C_n^s \\  
-\frac{dC_n^r}{dt} &= \beta_{pn}^r U_n - \delta C_n^r  
-\end{align*}
-
-To the best of my coding knowledge I have been able to come up with these custom modules below that more or less illustrates what happens in the above ODEs, but applied to an ICM using the EpiModel framework. 
-
-below is the name of the different parameters involved in the ICM
-
 ```{r}
 
-params <- list(
-  psi_s    = NA,  # Treatment rate from MSSA infection
-  psi_r    = NA,  # Treatment rate from MRSA infection
-  iota     = NA,  # Treatment success probability
-  s_b      = NA,  # Fitness cost
-  s_p      = NA,  # Penalty on treatment efficacy due to resistance
-  a        = NA,  # Contact rate between patients and HCWs
-  b_pn     = NA,  # Transmission probability from patient to HCW
-  theta    = NA,  # Precaution compliance of HCWs
-  n        = NA,  # Penalty on transmission capabilities in colonized patients
-  low      = NA,  # Lower threshold for decontamination of HCW
-  high     = NA,  # Upper threshold for decontamination of HCW
-  kappa    = NA,  # Duration of colonization (inverse = clearance rate)
-  m_s      = NA,  # Probability of developing infection when colonized
-  delta_m  = NA,  # Increment in m_s when colonized by resistance strain
-  x        = NA,  # Proportion of exposed who develop infection directly
-  b_np     = NA   # Transmission probability from HCW to patient
-)
-```
+# Load required libraries
+library(EpiModel)
+library(ggplot2)
+library(dplyr)
 
+# =============================================================================
+# 1. PARAMETERS
+# =============================================================================
 
-```{r Custom initialize.FUN}
+param_init <- function() {
+  params <- list(
+    # Population parameters
+    initial_pop_size = 1000,
+    prob_patient = 0.85,
+    
+    # Initial status probabilities for patients (must sum to 1)
+    prob_status = c(Sp = 0.80, Cp_s = 0.07, Cp_r = 0.05, Ip_s = 0.05, Ip_r = 0.03),
+    
+    # Transmission parameters
+    a = 10,           # Contact rate between patients and HCWs
+    b_np = 0.05,      # Transmission probability from HCW to patient
+    b_pn = 0.05,      # Transmission probability from patient to HCW
+    theta = 0.5,      # Precaution compliance of HCWs
+    
+    # Strain-specific parameters
+    s_b = 0.2,        # Fitness cost of resistance (reduces transmission)
+    s_p = 0.3,        # Penalty on treatment efficacy due to resistance
+    n = 0.5,          # Penalty on transmission in colonized patients
+    
+    # Clinical parameters
+    x = 0.3,          # Proportion exposed who develop infection directly
+    kappa = 0.1,      # Clearance rate of colonization (1/duration)
+    m_s = 0.2,        # Probability of developing infection when colonized (MSSA)
+    delta_m = 0.5,    # Increment in m_s for MRSA
+    
+    # Treatment parameters
+    psi_s = 0.4,      # Treatment rate for MSSA infection
+    psi_r = 0.2,      # Treatment rate for MRSA infection
+    iota = 0.7,       # Treatment success probability
+    
+    # Decontamination parameters
+    low = 0.1,        # Decontamination rate with low compliance
+    high = 0.9,       # Decontamination rate with high compliance
+    
+    # Other parameters
+    nsteps = 100,     # Number of simulation steps
+    seed = 12345      # For reproducibility
+  )
+  return(params)
+}
 
-initialize_module <- function(dat, at) {
+# =============================================================================
+# 2. INITIALIZATION MODULE
+# =============================================================================
+
+initialize_icm <- function(dat, at) {
   
   # Get parameters
   initial_pop_size <- get_param(dat, "initial_pop_size")
-  prob_patient <- get_param(dat, "prob_patient", 0.85)  # Default: 85% patients
-  prob_status_patients <- get_param(dat, "prob_status_patients", 
-                                   c(0.80, 0.07, 0.05, 0.05, 0.03))  # Sp, Cp_s, Cp_r, Ip_s, Ip_r
-
-  # Initialize core attributes
+  prob_patient <- get_param(dat, "prob_patient")
+  prob_status <- get_param(dat, "prob_status")
+  
+  # Set seed for reproducibility
+  set.seed(get_param(dat, "seed"))
+  
+  # Initialize active status (all alive initially)
   active <- rep(1, initial_pop_size)
-  type <- sample(c("patient", "nurse"), 
-                 initial_pop_size, 
-                 replace = TRUE, 
-                 prob = c(prob_patient, 1 - prob_patient))
+  
+  # Assign types (patient or nurse)
+  type <- sample(
+    c("patient", "nurse"),
+    initial_pop_size,
+    replace = TRUE,
+    prob = c(prob_patient, 1 - prob_patient)
+  )
+  
+  # Initialize status vector
   status <- rep(NA, initial_pop_size)
-
+  
   # Assign patient statuses
   patients <- which(type == "patient")
   status[patients] <- sample(
-    c("Sp", "Cp_s", "Cp_r", "Ip_s", "Ip_r"),
+    names(prob_status),
     length(patients),
     replace = TRUE,
-    prob = prob_status_patients
+    prob = prob_status
   )
-
+  
   # Nurses start uncontaminated
-  status[which(type == "nurse")] <- "Un"
-
+  nurses <- which(type == "nurse")
+  status[nurses] <- "Un"
+  
   # Set attributes
   dat <- set_attr(dat, "active", active)
   dat <- set_attr(dat, "type", type)
   dat <- set_attr(dat, "status", status)
-
-  # Track initial counts (for summary stats)
-  dat <- set_epi(dat, "init.num.Sp", at, sum(status == "Sp"))
-  dat <- set_epi(dat, "init.num.Cp_s", at, sum(status == "Cp_s"))
-  dat <- set_epi(dat, "init.num.Cp_r", at, sum(status == "Cp_r"))
-  dat <- set_epi(dat, "init.num.Ip_s", at, sum(status == "Ip_s"))
-  dat <- set_epi(dat, "init.num.Ip_r", at, sum(status == "Ip_r"))
-  dat <- set_epi(dat, "init.num.Un", at, sum(status == "Un"))
-
+  
+  # Record initial counts
+  dat <- set_epi(dat, "num.Sp", at, sum(status == "Sp", na.rm = TRUE))
+  dat <- set_epi(dat, "num.Cp_s", at, sum(status == "Cp_s", na.rm = TRUE))
+  dat <- set_epi(dat, "num.Cp_r", at, sum(status == "Cp_r", na.rm = TRUE))
+  dat <- set_epi(dat, "num.Ip_s", at, sum(status == "Ip_s", na.rm = TRUE))
+  dat <- set_epi(dat, "num.Ip_r", at, sum(status == "Ip_r", na.rm = TRUE))
+  dat <- set_epi(dat, "num.Un", at, sum(status == "Un", na.rm = TRUE))
+  dat <- set_epi(dat, "num.Cn_s", at, sum(status == "Cn_s", na.rm = TRUE))
+  dat <- set_epi(dat, "num.Cn_r", at, sum(status == "Cn_r", na.rm = TRUE))
+  
   return(dat)
-  
 }
-```
 
+# =============================================================================
+# 3. INFECTION MODULE (Patient Infection from Nurses)
+# =============================================================================
 
-```{r Module 1}
-
-infection_module <-function(dat, at) {
+infection_module <- function(dat, at) {
   
-  #Get attributes
+  # Get attributes
   active <- get_attr(dat, "active")
   status <- get_attr(dat, "status")
   type <- get_attr(dat, "type")
   
-  #Initialize trackers
+  # Get parameters
+  a <- get_param(dat, "a")
+  x <- get_param(dat, "x")
+  s_b <- get_param(dat, "s_b")
+  b_np <- get_param(dat, "b_np")
+  theta <- get_param(dat, "theta")
+  
+  # Find susceptible patients
+  idsElig <- which(active == 1 & type == "patient" & status == "Sp")
+  
+  # Initialize counters
   nInf_s <- 0
   nInf_r <- 0
   nCol_s <- 0
   nCol_r <- 0
   
-  #Find susceptible patients
-  idEligs <- which(active == 1 & type == "patient" & status == "Sp")
-  
-  if(length(idEligs >0)){
+  if (length(idsElig) > 0) {
     
-    #Call parameters
-    a <- get_param(dat, "a")
-    x <- get_param(dat, "x")
-    s_b <- get_param(dat, "s_b")
-    b_np <- get_param(dat, "b_np")
-    theta <- get_param(dat, "theta")
+    # Calculate contamination pressure from nurses
+    total_nurses <- sum(active == 1 & type == "nurse")
     
-    #what is the contamination pressure
-    Cn_s <- sum(active == 1 & type == "nurse" & status == "Cn_s")
-    Cn_r <- sum(active == 1 & type == "nurse" & status == "Cn_r")
-    Nn <- sum(active == 1 & type == "nurse")
-    
-    #Define the force of infection
-    beta_np_s <- a * b_np * (1-theta) * Cn_s/Nn
-    beta_np_r <- a * b_np * (1 - theta) * (1 - s_b) * Cn_r / Nn
-    
-    #Derive prob from FOI
-    probInf_s <- 1 - exp(-beta_np_s)
-    probInf_r <- 1 - exp(-beta_np_r)
-    
-    #Simulate infections
-    inf_s <- rbinom(length(idEligs), 1, probInf_s)
-    inf_r <- rbinom(length(idEligs), 1, probInf_r)
-    
-    #Setting initial infection processes
-    for(i in seq_along(idEligs)){
+    if (total_nurses > 0) {
+      Cn_s <- sum(active == 1 & type == "nurse" & status == "Cn_s")
+      Cn_r <- sum(active == 1 & type == "nurse" & status == "Cn_r")
       
-      id <- idEligs[i]
+      # Force of infection
+      beta_np_s <- a * b_np * (1 - theta) * Cn_s / total_nurses
+      beta_np_r <- a * b_np * (1 - theta) * (1 - s_b) * Cn_r / total_nurses
       
-      if(inf_s[i] == 1 && inf_r[i] == 0){
+      # Probabilities
+      probInf_s <- 1 - exp(-beta_np_s)
+      probInf_r <- 1 - exp(-beta_np_r)
+      
+      # Simulate infections
+      inf_s <- rbinom(length(idsElig), 1, probInf_s)
+      inf_r <- rbinom(length(idsElig), 1, probInf_r)
+      
+      # Process infections
+      for (i in seq_along(idsElig)) {
+        id <- idsElig[i]
         
-        if(runif(1) < x){
-          status[id] <- "Ip_s"
-          nInf_s <- nInf_s + 1
-        } else {
-          status[id] <- "Cp_s"
-          nCol_s <- nCol_s + 1
+        # MSSA infection
+        if (inf_s[i] == 1 && inf_r[i] == 0) {
+          if (runif(1) < x) {
+            status[id] <- "Ip_s"
+            nInf_s <- nInf_s + 1
+          } else {
+            status[id] <- "Cp_s"
+            nCol_s <- nCol_s + 1
+          }
         }
         
-      } else 
+        # MRSA infection
+        if (inf_r[i] == 1 && inf_s[i] == 0) {
+          if (runif(1) < x) {
+            status[id] <- "Ip_r"
+            nInf_r <- nInf_r + 1
+          } else {
+            status[id] <- "Cp_r"
+            nCol_r <- nCol_r + 1
+          }
+        }
         
-      if(inf_s[i] == 0 && inf_r[i] == 1){
-        
-        if(runif(1) < x){
-          status[id] <- "Ip_r"
-          nInf_r <- nInf_r + 1
-        } else {
-          status[id] <- "Ip_r"
-          nCol_r <- nCol_r + 1
+        # If both infections occur, prioritize MRSA (more severe)
+        if (inf_s[i] == 1 && inf_r[i] == 1) {
+          if (runif(1) < x) {
+            status[id] <- "Ip_r"
+            nInf_r <- nInf_r + 1
+          } else {
+            status[id] <- "Cp_r"
+            nCol_r <- nCol_r + 1
+          }
         }
       }
     }
-    
-  # Update attributes
-  dat <- set_attr(dat, "status", status)  
-    
   }
+  
+  # Update attributes
+  dat <- set_attr(dat, "status", status)
   
   # Record flows
   dat <- set_epi(dat, "np.inf.flow.s", at, nInf_s)
   dat <- set_epi(dat, "np.inf.flow.r", at, nInf_r)
+  dat <- set_epi(dat, "np.col.flow.s", at, nCol_s)
+  dat <- set_epi(dat, "np.col.flow.r", at, nCol_r)
   
-  return(dat) 
-  
+  return(dat)
 }
 
-```
-
-```{r Module 2}
+# =============================================================================
+# 4. PROGRESSION MODULE (Colonization to Infection)
+# =============================================================================
 
 progression_module <- function(dat, at) {
   
@@ -190,42 +225,37 @@ progression_module <- function(dat, at) {
   active <- get_attr(dat, "active")
   status <- get_attr(dat, "status")
   
-  # Initialize trackers
-  nProg_s <- 0
-  nProg_r <- 0
-  
-  # Find colonized patients
-  idsElig_s <- which(active == 1 & status == "Cp_s")
-  idsElig_r <- which(active == 1 & status == "Cp_r")
-  
   # Get parameters
   kappa <- get_param(dat, "kappa")
   m_s <- get_param(dat, "m_s")
   delta_m <- get_param(dat, "delta_m")
   
-  # Calculate progression rates
+  # Find colonized patients
+  idsElig_s <- which(active == 1 & status == "Cp_s")
+  idsElig_r <- which(active == 1 & status == "Cp_r")
+  
+  # Progression rates
   gamma_s <- kappa * m_s
   gamma_r <- kappa * m_s * (1 + delta_m)
   
-  # Simulate progression
+  # Initialize counters
+  nProg_s <- 0
+  nProg_r <- 0
+  
+  # MSSA progression
   if (length(idsElig_s) > 0) {
-    
     prog_s <- rbinom(length(idsElig_s), 1, gamma_s)
     nProg_s <- sum(prog_s)
-    
     if (nProg_s > 0) {
-      
       status[idsElig_s[which(prog_s == 1)]] <- "Ip_s"
     }
   }
   
+  # MRSA progression
   if (length(idsElig_r) > 0) {
-    
     prog_r <- rbinom(length(idsElig_r), 1, gamma_r)
     nProg_r <- sum(prog_r)
-    
     if (nProg_r > 0) {
-    
       status[idsElig_r[which(prog_r == 1)]] <- "Ip_r"
     }
   }
@@ -238,11 +268,11 @@ progression_module <- function(dat, at) {
   dat <- set_epi(dat, "prog.flow.r", at, nProg_r)
   
   return(dat)
-  
 }
-```
 
-```{r Module 3}
+# =============================================================================
+# 5. TREATMENT MODULE
+# =============================================================================
 
 treatment_module <- function(dat, at) {
   
@@ -250,27 +280,25 @@ treatment_module <- function(dat, at) {
   active <- get_attr(dat, "active")
   status <- get_attr(dat, "status")
   
-  # Initialize trackers
-  nTreat_s <- 0 
-  nTreat_r <- 0
-  nRecov_s <- 0
-  nRecov_r <- 0
-  nDischarge <- 0
+  # Get parameters
+  psi_s <- get_param(dat, "psi_s")
+  psi_r <- get_param(dat, "psi_r")
+  iota <- get_param(dat, "iota")
+  s_p <- get_param(dat, "s_p")
   
   # Find infected patients
   idsElig_s <- which(active == 1 & status == "Ip_s")
   idsElig_r <- which(active == 1 & status == "Ip_r")
   
-  # Get parameters
-  psi_s <- get_param(dat, "psi_s")
-  psi_r <- get_param(dat, "psi_r")
-  iota <- get_param(dat, "iota")
-  s_b <- get_param(dat, "s_b")
-  s_p <- get_param(dat, "s_p")
+  # Initialize counters
+  nTreat_s <- 0
+  nTreat_r <- 0
+  nRecov_s <- 0
+  nRecov_r <- 0
+  nDischarge <- 0
   
   # MSSA treatment
   if (length(idsElig_s) > 0) {
-    
     treat_s <- rbinom(length(idsElig_s), 1, psi_s)
     nTreat_s <- sum(treat_s)
     
@@ -278,7 +306,10 @@ treatment_module <- function(dat, at) {
       treated_s <- idsElig_s[which(treat_s == 1)]
       recover <- rbinom(nTreat_s, 1, iota)
       nRecov_s <- sum(recover)
+      
       status[treated_s[which(recover == 1)]] <- "Sp"
+      
+      # Treatment failure -> discharge/death
       active[treated_s[which(recover == 0)]] <- 0
       nDischarge <- nDischarge + sum(recover == 0)
     }
@@ -286,7 +317,6 @@ treatment_module <- function(dat, at) {
   
   # MRSA treatment
   if (length(idsElig_r) > 0) {
-    
     treat_r <- rbinom(length(idsElig_r), 1, psi_r)
     nTreat_r <- sum(treat_r)
     
@@ -294,7 +324,10 @@ treatment_module <- function(dat, at) {
       treated_r <- idsElig_r[which(treat_r == 1)]
       recover <- rbinom(nTreat_r, 1, iota * (1 - s_p))
       nRecov_r <- sum(recover)
+      
       status[treated_r[which(recover == 1)]] <- "Sp"
+      
+      # Treatment failure -> discharge/death
       active[treated_r[which(recover == 0)]] <- 0
       nDischarge <- nDischarge + sum(recover == 0)
     }
@@ -312,11 +345,11 @@ treatment_module <- function(dat, at) {
   dat <- set_epi(dat, "discharge.flow", at, nDischarge)
   
   return(dat)
-  
 }
-```
 
-```{r Module 4}
+# =============================================================================
+# 6. NURSE CONTAMINATION MODULE
+# =============================================================================
 
 nurse_contamination_module <- function(dat, at) {
   
@@ -325,64 +358,73 @@ nurse_contamination_module <- function(dat, at) {
   status <- get_attr(dat, "status")
   type <- get_attr(dat, "type")
   
-  # Initialize trackers
-  nContam_s <- 0
-  nContam_r <- 0
+  # Get parameters
+  a <- get_param(dat, "a")
+  b_pn <- get_param(dat, "b_pn")
+  theta <- get_param(dat, "theta")
+  s_b <- get_param(dat, "s_b")
+  n <- get_param(dat, "n")
   
   # Find uncontaminated nurses
   idsElig <- which(active == 1 & type == "nurse" & status == "Un")
   
+  # Initialize counters
+  nContam_s <- 0
+  nContam_r <- 0
+  
   if (length(idsElig) > 0) {
     
-    # Get parameters
-    a <- get_param(dat, "a")
-    b_pn <- get_param(dat, "b_pn")
-    theta <- get_param(dat, "theta")
-    s_b <- get_param(dat, "s_b")
-    n <- get_param(dat, "n")
-    
-    # Calculate contamination pressures
+    # Get patient counts
     Np <- sum(active == 1 & type == "patient")
-    phi <- Np / length(idsElig)
-    Cp_s <- sum(active == 1 & status == "Cp_s")
-    Ip_s <- sum(active == 1 & status == "Ip_s")
-    Cp_r <- sum(active == 1 & status == "Cp_r")
-    Ip_r <- sum(active == 1 & status == "Ip_r")
     
-    beta_pn_s <- a * b_pn * (1 - theta) * phi * ((n * Cp_s + Ip_s) / Np)
-    beta_pn_r <- a * b_pn * (1 - theta) * phi * (1 - s_b) * ((n * Cp_r + Ip_r) / Np)
-    
-    #Convert to probabilities
-    probCtm_s <- 1 - exp(-beta_pn_s)
-    probCtm_r <- 1 - exp(-beta_pn_r)
-    
-    # Simulate contamination
-    contam_s <- rbinom(length(idsElig), 1, probCtm_s)
-    contam_r <- rbinom(length(idsElig), 1, probCtm_r)
-    
-    # Process contamination
-    for (i in seq_along(idsElig)) {
+    if (Np > 0) {
+      Cp_s <- sum(active == 1 & status == "Cp_s")
+      Ip_s <- sum(active == 1 & status == "Ip_s")
+      Cp_r <- sum(active == 1 & status == "Cp_r")
+      Ip_r <- sum(active == 1 & status == "Ip_r")
       
-      id <- idsElig[i]
+      # Contact rate scaling
+      phi <- Np / length(idsElig)
       
-      if (contam_s[i] == 1 && contam_r[i] == 0) {
+      # Force of contamination
+      beta_pn_s <- a * b_pn * (1 - theta) * phi * ((n * Cp_s + Ip_s) / Np)
+      beta_pn_r <- a * b_pn * (1 - theta) * phi * (1 - s_b) * ((n * Cp_r + Ip_r) / Np)
+      
+      # Probabilities
+      probCtm_s <- 1 - exp(-beta_pn_s)
+      probCtm_r <- 1 - exp(-beta_pn_r)
+      
+      # Simulate contamination
+      contam_s <- rbinom(length(idsElig), 1, probCtm_s)
+      contam_r <- rbinom(length(idsElig), 1, probCtm_r)
+      
+      # Process contamination
+      for (i in seq_along(idsElig)) {
+        id <- idsElig[i]
         
-        status[id] <- "Cn_s"
-        nContam_s <- nContam_s + 1
-      } else 
+        # MSSA contamination
+        if (contam_s[i] == 1 && contam_r[i] == 0) {
+          status[id] <- "Cn_s"
+          nContam_s <- nContam_s + 1
+        }
         
-      if (contam_r[i] == 1 && contam_s[i] == 0) {
+        # MRSA contamination
+        if (contam_r[i] == 1 && contam_s[i] == 0) {
+          status[id] <- "Cn_r"
+          nContam_r <- nContam_r + 1
+        }
         
-        status[id] <- "Cn_r"
-        nContam_r <- nContam_r + 1
+        # Both - prioritize MRSA
+        if (contam_s[i] == 1 && contam_r[i] == 1) {
+          status[id] <- "Cn_r"
+          nContam_r <- nContam_r + 1
+        }
       }
-      
     }
-    
-    
-    # Update attributes
-    dat <- set_attr(dat, "status", status)
   }
+  
+  # Update attributes
+  dat <- set_attr(dat, "status", status)
   
   # Record flows
   dat <- set_epi(dat, "pn.contam.flow.s", at, nContam_s)
@@ -390,51 +432,48 @@ nurse_contamination_module <- function(dat, at) {
   
   return(dat)
 }
-```
 
-```{r Module 5}
+# =============================================================================
+# 7. DECONTAMINATION MODULE
+# =============================================================================
 
 decontamination_module <- function(dat, at) {
   
   # Get attributes
   active <- get_attr(dat, "active")
   status <- get_attr(dat, "status")
-  
-  # Initialize trackers
-  nDecon_s <- 0
-  nDecon_r <- 0
-  
-  # Find contaminated nurses
-  idsElig_s <- which(active == 1 & status == "Cn_s")
-  idsElig_r <- which(active == 1 & status == "Cn_r")
+  type <- get_attr(dat, "type")
   
   # Get parameters
   theta <- get_param(dat, "theta")
   low <- get_param(dat, "low")
   high <- get_param(dat, "high")
   
-  # Calculate decontamination rate
+  # Find contaminated nurses
+  idsElig_s <- which(active == 1 & type == "nurse" & status == "Cn_s")
+  idsElig_r <- which(active == 1 & type == "nurse" & status == "Cn_r")
+  
+  # Decontamination rate
   delta <- (1 - theta) * low + theta * high
   
-  # Simulate decontamination
+  # Initialize counters
+  nDecon_s <- 0
+  nDecon_r <- 0
+  
+  # MSSA decontamination
   if (length(idsElig_s) > 0) {
-    
     decon_s <- rbinom(length(idsElig_s), 1, delta)
     nDecon_s <- sum(decon_s)
-    
     if (nDecon_s > 0) {
-      
       status[idsElig_s[which(decon_s == 1)]] <- "Un"
     }
   }
   
+  # MRSA decontamination
   if (length(idsElig_r) > 0) {
-    
     decon_r <- rbinom(length(idsElig_r), 1, delta)
     nDecon_r <- sum(decon_r)
-    
     if (nDecon_r > 0) {
-      
       status[idsElig_r[which(decon_r == 1)]] <- "Un"
     }
   }
@@ -447,8 +486,241 @@ decontamination_module <- function(dat, at) {
   dat <- set_epi(dat, "decon.flow.r", at, nDecon_r)
   
   return(dat)
-  
 }
 
+# =============================================================================
+# HELPER FUNCTIONS (replace EpiModel's get_attr/set_attr/get_param/set_epi)
+# =============================================================================
+
+get_attr <- function(dat, name) dat$attr[[name]]
+set_attr <- function(dat, name, value) { dat$attr[[name]] <- value; dat }
+get_param <- function(dat, name) dat$param[[name]]
+
+set_epi <- function(dat, name, at, value) {
+  if (is.null(dat$epi[[name]])) {
+    dat$epi[[name]] <- rep(NA_real_, dat$param$nsteps)
+  }
+  dat$epi[[name]][at] <- value
+  dat
+}
+
+# =============================================================================
+# SIMULATION WRAPPER (custom loop, no EpiModel icm()/netsim())
+# =============================================================================
+
+run_simulation <- function(params = NULL) {
+  
+  if (is.null(params)) {
+    params <- param_init()
+  }
+  
+  # Minimal "dat" object to carry attributes, params, and epi trackers
+  dat <- list(
+    attr = list(),
+    param = params,
+    epi = list()
+  )
+  
+  # Initialize population at t = 1
+  dat <- initialize_icm(dat, at = 1)
+  
+  # Run remaining modules for each subsequent time step
+  for (at in 2:params$nsteps) {
+    dat <- infection_module(dat, at)
+    dat <- progression_module(dat, at)
+    dat <- treatment_module(dat, at)
+    dat <- nurse_contamination_module(dat, at)
+    dat <- decontamination_module(dat, at)
+    
+    # Carry forward cumulative state counts for this step
+    status <- get_attr(dat, "status")
+    active <- get_attr(dat, "active")
+    type   <- get_attr(dat, "type")
+    
+    dat <- set_epi(dat, "num.Sp",   at, sum(active == 1 & type == "patient" & status == "Sp",   na.rm = TRUE))
+    dat <- set_epi(dat, "num.Cp_s", at, sum(active == 1 & type == "patient" & status == "Cp_s", na.rm = TRUE))
+    dat <- set_epi(dat, "num.Cp_r", at, sum(active == 1 & type == "patient" & status == "Cp_r", na.rm = TRUE))
+    dat <- set_epi(dat, "num.Ip_s", at, sum(active == 1 & type == "patient" & status == "Ip_s", na.rm = TRUE))
+    dat <- set_epi(dat, "num.Ip_r", at, sum(active == 1 & type == "patient" & status == "Ip_r", na.rm = TRUE))
+    dat <- set_epi(dat, "num.Un",   at, sum(active == 1 & type == "nurse"   & status == "Un",   na.rm = TRUE))
+    dat <- set_epi(dat, "num.Cn_s", at, sum(active == 1 & type == "nurse"   & status == "Cn_s", na.rm = TRUE))
+    dat <- set_epi(dat, "num.Cn_r", at, sum(active == 1 & type == "nurse"   & status == "Cn_r", na.rm = TRUE))
+  }
+  
+  class(dat) <- "simdat"
+  
+  return(dat)
+}
+
+# =============================================================================
+# EXTRACTOR (replaces as.data.frame(sim) from EpiModel)
+# =============================================================================
+
+as.data.frame.simdat <- function(dat) {
+  epi_df <- as.data.frame(dat$epi)
+  epi_df$time <- seq_len(dat$param$nsteps)
+  return(epi_df)
+}
+
+# =============================================================================
+# PLOTTING FUNCTIONS 
+# =============================================================================
+
+plot_simulation <- function(sim) {
+  
+  df <- as.data.frame.simdat(sim)
+  
+  p1 <- ggplot(df, aes(x = time)) +
+    geom_line(aes(y = num.Sp,   color = "Susceptible"),    linewidth = 1.2) +
+    geom_line(aes(y = num.Cp_s, color = "Colonized MSSA"), linewidth = 1.2) +
+    geom_line(aes(y = num.Cp_r, color = "Colonized MRSA"), linewidth = 1.2) +
+    geom_line(aes(y = num.Ip_s, color = "Infected MSSA"),  linewidth = 1.2) +
+    geom_line(aes(y = num.Ip_r, color = "Infected MRSA"),  linewidth = 1.2) +
+    labs(
+      title = "Patient States Over Time",
+      x = "Time Steps",
+      y = "Number of Patients",
+      color = "State"
+    ) +
+    theme_minimal() +
+    theme(
+      legend.position = "bottom",
+      legend.title = element_text(size = 10),
+      legend.text = element_text(size = 9)
+    ) +
+    scale_color_manual(
+      values = c(
+        "Susceptible" = "#2E86C1",
+        "Colonized MSSA" = "#28B463",
+        "Colonized MRSA" = "#F39C12",
+        "Infected MSSA" = "#E74C3C",
+        "Infected MRSA" = "#943126"
+      )
+    )
+  
+  p2 <- ggplot(df, aes(x = time)) +
+    geom_line(aes(y = num.Un,   color = "Uncontaminated"),     linewidth = 1.2) +
+    geom_line(aes(y = num.Cn_s, color = "Contaminated MSSA"),  linewidth = 1.2) +
+    geom_line(aes(y = num.Cn_r, color = "Contaminated MRSA"),  linewidth = 1.2) +
+    labs(
+      title = "Nurse States Over Time",
+      x = "Time Steps",
+      y = "Number of Nurses",
+      color = "State"
+    ) +
+    theme_minimal() +
+    theme(
+      legend.position = "bottom",
+      legend.title = element_text(size = 10),
+      legend.text = element_text(size = 9)
+    ) +
+    scale_color_manual(
+      values = c(
+        "Uncontaminated" = "#2E86C1",
+        "Contaminated MSSA" = "#28B463",
+        "Contaminated MRSA" = "#F39C12"
+      )
+    )
+  
+  library(patchwork)
+  combined_plot <- p1 / p2 +
+    plot_annotation(
+      title = "MSSA/MRSA Transmission Dynamics in Hospital",
+      subtitle = "Individual-Based Model Simulation"
+    )
+  
+  print(combined_plot)
+  
+  return(list(patient_plot = p1, nurse_plot = p2, combined = combined_plot))
+}
+
+# =============================================================================
+# RUN
+# =============================================================================
+
+sim_results <- run_simulation()
+plots <- plot_simulation(sim_results)
+# =============================================================================
+# 10. RUN THE SIMULATION
+# =============================================================================
+
+# Run with default parameters
+cat("Running simulation...\n")
+sim_results <- run_simulation()
+
+# Plot the results
+cat("\nGenerating plots...\n")
+plots <- plot_simulation(sim_results)
+
+# Display summary statistics
+cat("\nSummary Statistics:\n")
+df <- as.data.frame(sim_results)
+last_row <- df[nrow(df), ]
+cat(sprintf("Final population: %d patients, %d nurses\n", 
+            sum(last_row$num.Sp + last_row$num.Cp_s + last_row$num.Cp_r + 
+                  last_row$num.Ip_s + last_row$num.Ip_r),
+            sum(last_row$num.Un + last_row$num.Cn_s + last_row$num.Cn_r)))
+
+cat(sprintf("Final MSSA prevalence: %.2f%%\n", 
+            100 * (last_row$num.Cp_s + last_row$num.Ip_s) / 
+              (last_row$num.Sp + last_row$num.Cp_s + last_row$num.Cp_r + 
+                 last_row$num.Ip_s + last_row$num.Ip_r)))
+
+cat(sprintf("Final MRSA prevalence: %.2f%%\n", 
+            100 * (last_row$num.Cp_r + last_row$num.Ip_r) / 
+              (last_row$num.Sp + last_row$num.Cp_s + last_row$num.Cp_r + 
+                 last_row$num.Ip_s + last_row$num.Ip_r)))
+
+# =============================================================================
+# 11. SENSITIVITY ANALYSIS EXAMPLE
+# =============================================================================
+
+run_sensitivity <- function() {
+  
+  # Test different compliance levels
+  theta_values <- c(0.3, 0.5, 0.7)
+  results <- list()
+  
+  for (i in seq_along(theta_values)) {
+    cat(sprintf("\nRunning simulation with theta = %.1f...\n", theta_values[i]))
+    
+    params <- param_init()
+    params$theta <- theta_values[i]
+    params$nsteps <- 50  # Shorter for sensitivity
+    
+    sim <- run_simulation(params)
+    df <- as.data.frame.simdat(sim)   
+    results[[i]] <- df
+  }
+  
+  # Plot comparison
+  plot_df <- data.frame()
+  for (i in seq_along(theta_values)) {
+    temp <- results[[i]]
+    temp$theta <- theta_values[i]
+    plot_df <- rbind(plot_df, temp)
+  }
+  
+  p <- ggplot(plot_df, aes(x = time, y = num.Ip_s + num.Ip_r, color = factor(theta))) +
+    geom_line(linewidth = 1.2) +
+    labs(
+      title = "Effect of HCW Compliance on Total Infections",
+      x = "Time Steps",
+      y = "Total Infected Patients",
+      color = "Compliance (θ)"
+    ) +
+    theme_minimal() +
+    theme(legend.position = "bottom")
+  
+  print(p)
+  
+  return(results)
+}
+
+# Uncomment to run sensitivity analysis
+# sensitivity_results <- run_sensitivity()
+
 ```
+
+
 
