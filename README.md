@@ -1,1 +1,1 @@
-# EpiModel_ICM
+# Epimodel-icm
